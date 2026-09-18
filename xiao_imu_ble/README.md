@@ -12,12 +12,33 @@ pip install platformio
 
 ## Build & Flash
 
-Connect the Xiao to your Mac via USB-C, then:
+Connect the Xiao via USB-C, then:
 
 ```bash
-cd motion-controller/firmware/xiao_imu_ble
 pio run --target upload
 ```
+
+BLE firmware (default):
+
+```bash
+pio run -e xiaoblesense_adafruit --target upload
+```
+
+USB CDC streaming firmware:
+
+```bash
+pio run -e xiaoblesense_usb --target upload
+```
+
+Dual BLE + USB firmware (for transport verification):
+
+```bash
+pio run -e xiaoblesense_dual --target upload
+```
+
+The USB build streams binary `XIMU` frames over the USB serial port in batches of
+16 samples. It does not print text on the CDC port. Dual mode streams the same
+samples on both transports with a shared sequence counter.
 
 If the board isn't detected, **double-tap the tiny reset button** to enter the
 UF2 bootloader. It will appear as a USB mass-storage device. Then retry the
@@ -25,11 +46,13 @@ upload command.
 
 ## Serial Monitor
 
-Optional — view debug output:
+Optional for the BLE build only:
 
 ```bash
 pio device monitor
 ```
+
+Do not use the serial monitor while the USB proxy is connected to the device.
 
 ## Usage with Motion Controller
 
@@ -115,12 +138,37 @@ the `bluetooth` group).
 
 ### Run
 
+BLE (default):
+
 ```bash
 python -m proxy --host 127.0.0.1 --port 8765
 ```
 
+USB (after flashing `xiaoblesense_usb`):
+
+```bash
+python -m proxy --transport usb --serial /dev/ttyACM0
+```
+
+Dual verification (after flashing `xiaoblesense_dual`):
+
+```bash
+python -m proxy --transport dual --serial /dev/ttyACM0 --tcp-source ble
+```
+
+Dual mode runs independent BLE and USB clock sync, compares offset/scale and
+matches samples by `sequence`, and forwards one transport to TCP (`--tcp-source
+ble|usb`, default `ble`).
+
+USB uses the same clock-sync algorithm as BLE (startup ping burst + periodic
+refresh) and emits TCP protocol v2 with host-aligned timestamps by default.
+Use `--raw-timestamps` for device `micros()` without sync (not supported in dual
+mode).
+
 Optional flags:
 
+- `--transport ble|usb` — input source (default `ble`)
+- `--serial /dev/ttyACM0` — USB serial port
 - `--device-name XiaoIMU` — BLE advertised name (default)
 - `--address AA:BB:CC:DD:EE:FF` — connect by address instead of scanning by name
 - `--stats-interval 5` — log throughput and drop counters every N seconds (default `5`, `0` disables)
@@ -134,6 +182,28 @@ On Linux the proxy negotiates BLE MTU after connect so the device can batch up t
 
 Only one BLE central can connect to the Xiao at a time. Do not run the proxy
 while the Motion Controller is already connected to the device.
+
+### USB CDC frame format
+
+Each serial message from the USB firmware uses an 8-byte header:
+
+| Offset | Type | Field |
+|--------|------|-------|
+| 0 | 4 bytes | magic `XIMU` |
+| 4 | uint8 | version (`1`) |
+| 5 | uint8 | `msg_type` |
+| 6 | uint16 LE | `payload_len` |
+| 8 | `payload_len` | payload |
+
+Message types:
+
+| `msg_type` | Direction | Payload |
+|------------|-----------|---------|
+| `0x01` | device → host | `N × 29` IMU samples |
+| `0x02` | host → device | `u32 request_id` (clock-sync ping) |
+| `0x03` | device → host | `u32 request_id`, `u32 timestamp_us` (clock-sync reply) |
+
+The proxy converts USB batches into the same TCP framing used for BLE.
 
 ### TCP frame format
 

@@ -1,4 +1,4 @@
-"""Bridge XiaoIMU BLE notifications to a localhost TCP stream."""
+"""Bridge XiaoIMU transports to a localhost TCP stream."""
 
 from __future__ import annotations
 
@@ -15,14 +15,18 @@ from .clock_sync import DEFAULT_REFRESH_INTERVAL_S, DEFAULT_REFRESH_PINGS, DEFAU
 from .protocol import (
     DEFAULT_DEVICE_NAME,
     ImuSample,
+    VERSION,
     encode_frame,
     parse_aligned_samples,
     parse_samples,
 )
+from .dual_client import DualImuClient
 from .stats import ProxyStats
+from .usb_client import UsbImuClient
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
 QUEUE_CAPACITY = 256
 DEFAULT_STATS_INTERVAL_S = 5.0
 DEFAULT_IDLE_WARN_S = 3.0
@@ -55,11 +59,11 @@ class TcpBroadcaster:
 
         await self._close_client("server stopping")
 
-    def reset_session(self, mtu: int) -> None:
+    def reset_session(self, mtu: int = 0) -> None:
         self.stats.reset_session(mtu)
 
     async def publish_batch(self, payload: bytes, version: int) -> None:
-        if version == 1:
+        if version == VERSION:
             samples = parse_samples(payload)
         else:
             samples = [
@@ -160,6 +164,7 @@ async def run_stats_reporter(
     stats: ProxyStats,
     interval_s: float,
     idle_warn_s: float,
+    transport: str,
     stop_event: asyncio.Event,
 ) -> None:
     while not stop_event.is_set():
@@ -169,63 +174,112 @@ async def run_stats_reporter(
         except asyncio.TimeoutError:
             pass
 
-        logging.info("stats: %s", stats.format_summary())
+        logging.info("stats: %s", stats.format_summary(transport=transport))
 
         idle_for = stats.seconds_since_last_batch()
         if idle_for is not None and idle_for >= idle_warn_s:
-            logging.warning(
-                "no IMU batches received for %.1f s (check BLE link and MTU)",
-                idle_for,
-            )
+            if transport == "usb":
+                logging.warning(
+                    "no IMU batches received for %.1f s (check USB cable and serial port)",
+                    idle_for,
+                )
+            else:
+                logging.warning(
+                    "no IMU batches received for %.1f s (check BLE link and MTU)",
+                    idle_for,
+                )
         elif idle_for is None and (time.monotonic() - stats.session_started_at) >= idle_warn_s:
-            logging.warning(
-                "no IMU batches received since BLE session started (check MTU and device link)"
-            )
+            if transport == "usb":
+                logging.warning(
+                    "no IMU batches received since USB session started (check serial port)"
+                )
+            else:
+                logging.warning(
+                    "no IMU batches received since BLE session started (check MTU and device link)"
+                )
 
 
 async def run_proxy(args: argparse.Namespace) -> None:
     stop_event = asyncio.Event()
-    stats = ProxyStats()
-    broadcaster = TcpBroadcaster(args.host, args.port, stats)
+    tcp_stats = ProxyStats()
+    ble_stats = ProxyStats()
+    usb_stats = ProxyStats()
+    broadcaster = TcpBroadcaster(args.host, args.port, tcp_stats)
+    input_client: XiaoBleClient | UsbImuClient | DualImuClient
 
-    def on_session_start(mtu: int) -> None:
-        broadcaster.reset_session(mtu)
+    def on_session_start_mtu(mtu: int) -> None:
+        tcp_stats.reset_session(mtu)
 
-    ble_client = XiaoBleClient(
-        device_name=args.device_name,
-        address=args.address,
-        on_batch=broadcaster.publish_batch,
-        on_session_start=on_session_start,
-        scan_timeout_s=args.scan_timeout,
-        align_timestamps=not args.raw_timestamps,
-        startup_sync_pings=args.sync_pings,
-        refresh_sync_pings=args.sync_refresh_pings,
-        refresh_interval_s=args.sync_refresh_interval,
-    )
+    def on_session_start_usb() -> None:
+        tcp_stats.reset_session(0)
+
+    if args.transport == "dual":
+        if args.raw_timestamps:
+            raise SystemExit("dual transport requires host-aligned timestamps")
+        input_client = DualImuClient(
+            ble_device_name=args.device_name,
+            ble_address=args.address,
+            usb_port=args.serial,
+            usb_baudrate=args.baudrate,
+            on_batch=broadcaster.publish_batch,
+            tcp_source=args.tcp_source,
+            ble_stats=ble_stats,
+            usb_stats=usb_stats,
+            scan_timeout_s=args.scan_timeout,
+            align_timestamps=True,
+            startup_sync_pings=args.sync_pings,
+            refresh_sync_pings=args.sync_refresh_pings,
+            refresh_interval_s=args.sync_refresh_interval,
+            compare_interval_s=args.stats_interval if args.stats_interval > 0 else 5.0,
+        )
+    elif args.transport == "usb":
+        input_client = UsbImuClient(
+            port=args.serial,
+            baudrate=args.baudrate,
+            on_batch=broadcaster.publish_batch,
+            on_session_start=on_session_start_usb,
+            align_timestamps=not args.raw_timestamps,
+            startup_sync_pings=args.sync_pings,
+            refresh_sync_pings=args.sync_refresh_pings,
+            refresh_interval_s=args.sync_refresh_interval,
+        )
+    else:
+        input_client = XiaoBleClient(
+            device_name=args.device_name,
+            address=args.address,
+            on_batch=broadcaster.publish_batch,
+            on_session_start=on_session_start_mtu,
+            scan_timeout_s=args.scan_timeout,
+            align_timestamps=not args.raw_timestamps,
+            startup_sync_pings=args.sync_pings,
+            refresh_sync_pings=args.sync_refresh_pings,
+            refresh_interval_s=args.sync_refresh_interval,
+        )
 
     await broadcaster.start()
 
-    ble_task = asyncio.create_task(ble_client.run(), name="ble-client")
+    input_task = asyncio.create_task(input_client.run(), name=f"{args.transport}-client")
     sender_task = asyncio.create_task(broadcaster.run_sender(stop_event), name="tcp-sender")
     stats_task: asyncio.Task[None] | None = None
-    if args.stats_interval > 0:
+    if args.stats_interval > 0 and args.transport != "dual":
         stats_task = asyncio.create_task(
             run_stats_reporter(
-                stats,
+                tcp_stats,
                 args.stats_interval,
                 args.idle_warn,
+                args.transport,
                 stop_event,
             ),
             name="stats-reporter",
         )
 
     try:
-        await ble_task
+        await input_task
     except asyncio.CancelledError:
         pass
     finally:
         stop_event.set()
-        await ble_client.stop()
+        await input_client.stop()
         await broadcaster.stop()
         sender_task.cancel()
         if stats_task is not None:
@@ -234,15 +288,43 @@ async def run_proxy(args: argparse.Namespace) -> None:
             await sender_task
             if stats_task is not None:
                 await stats_task
-        logging.info("final stats: %s", stats.format_summary())
+        if args.transport == "dual":
+            logging.info("final tcp stats: %s", tcp_stats.format_summary(transport=args.tcp_source))
+            logging.info("final ble stats: %s", ble_stats.format_summary(transport="ble"))
+            logging.info("final usb stats: %s", usb_stats.format_summary(transport="usb"))
+        else:
+            logging.info("final stats: %s", tcp_stats.format_summary(transport=args.transport))
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Receive XiaoIMU BLE batches and expose them on a localhost TCP port.",
+        description="Receive XiaoIMU batches over BLE or USB and expose them on a localhost TCP port.",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("ble", "usb", "dual"),
+        default="ble",
+        help="input transport",
+    )
+    parser.add_argument(
+        "--tcp-source",
+        choices=("ble", "usb"),
+        default="ble",
+        help="which transport feeds the TCP stream in dual mode",
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help="TCP bind address")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="TCP bind port")
+    parser.add_argument(
+        "--serial",
+        default=DEFAULT_SERIAL_PORT,
+        help="USB serial port for --transport usb",
+    )
+    parser.add_argument(
+        "--baudrate",
+        type=int,
+        default=115200,
+        help="USB serial baud rate",
+    )
     parser.add_argument(
         "--device-name",
         default=DEFAULT_DEVICE_NAME,

@@ -12,6 +12,11 @@ VERSION_ALIGNED = 2
 SAMPLE_SIZE = 29
 ALIGNED_SAMPLE_SIZE = 33
 HEADER_SIZE = 7  # magic(4) + version(1) + sample_count(2)
+USB_HEADER_SIZE = 8  # magic(4) + version(1) + msg_type(1) + payload_len(2)
+USB_MSG_IMU_BATCH = 0x01
+USB_MSG_SYNC_REQ = 0x02
+USB_MSG_SYNC_RESP = 0x03
+USB_BATCH_CAPACITY = 16
 
 SERVICE_UUID = "bfe2b6e1-0003-4583-926c-c39f476f7a34"
 IMU_CHAR_UUID = "bfe2b6e1-0004-4583-926c-c39f476f7a34"
@@ -119,6 +124,20 @@ def build_aligned_payload(device_payload: bytes, mapper) -> bytes:
     return bytes(payload)
 
 
+def encode_usb_frame(msg_type: int, payload: bytes, version: int = 1) -> bytes:
+    if len(payload) > 0xFFFF:
+        raise ValueError(f"USB payload too large: {len(payload)}")
+    return (
+        MAGIC
+        + struct.pack("<BBH", version, msg_type, len(payload))
+        + payload
+    )
+
+
+def encode_usb_sync_request(request_id: int) -> bytes:
+    return encode_usb_frame(USB_MSG_SYNC_REQ, struct.pack("<I", request_id))
+
+
 def encode_frame(payload: bytes, version: int = VERSION) -> bytes:
     sample_size = sample_size_for_version(version)
     if len(payload) % sample_size != 0:
@@ -150,6 +169,51 @@ def sequence_gap(previous: int | None, current: int) -> int | None:
 class Frame:
     version: int
     samples: list[ImuSample] | list[AlignedImuSample]
+
+
+@dataclass(frozen=True, slots=True)
+class UsbMessage:
+    version: int
+    msg_type: int
+    payload: bytes
+
+
+class UsbFrameStream:
+    """Incremental parser for framed USB CDC messages from the device."""
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    def feed(self, data: bytes) -> list[UsbMessage]:
+        self._buffer.extend(data)
+        messages: list[UsbMessage] = []
+
+        while True:
+            if len(self._buffer) < USB_HEADER_SIZE:
+                break
+
+            if bytes(self._buffer[:4]) != MAGIC:
+                magic_at = self._buffer.find(MAGIC, 1)
+                if magic_at < 0:
+                    if len(self._buffer) > 3:
+                        del self._buffer[:-3]
+                    break
+                del self._buffer[:magic_at]
+                if len(self._buffer) < USB_HEADER_SIZE:
+                    break
+
+            version = self._buffer[4]
+            msg_type = self._buffer[5]
+            payload_len = int.from_bytes(self._buffer[6:8], "little")
+            frame_len = USB_HEADER_SIZE + payload_len
+            if len(self._buffer) < frame_len:
+                break
+
+            payload = bytes(self._buffer[USB_HEADER_SIZE:frame_len])
+            del self._buffer[:frame_len]
+            messages.append(UsbMessage(version=version, msg_type=msg_type, payload=payload))
+
+        return messages
 
 
 class FrameStream:

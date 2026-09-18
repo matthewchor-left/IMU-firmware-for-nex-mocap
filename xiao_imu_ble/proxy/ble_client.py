@@ -33,6 +33,7 @@ from .stats import batch_capacity_for_mtu
 logger = logging.getLogger(__name__)
 
 OnBatchCallback = Callable[[bytes, int], Awaitable[None] | None]
+OnDeviceBatchCallback = Callable[[bytes], Awaitable[None] | None]
 OnSessionCallback = Callable[[int], Awaitable[None] | None]
 
 
@@ -51,6 +52,7 @@ class XiaoBleClient:
         device_name: str = DEFAULT_DEVICE_NAME,
         address: str | None = None,
         on_batch: OnBatchCallback,
+        on_device_batch: OnDeviceBatchCallback | None = None,
         on_session_start: OnSessionCallback | None = None,
         scan_timeout_s: float = 10.0,
         align_timestamps: bool = True,
@@ -61,6 +63,7 @@ class XiaoBleClient:
         self.device_name = device_name
         self.address = address
         self.on_batch = on_batch
+        self.on_device_batch = on_device_batch
         self.on_session_start = on_session_start
         self.scan_timeout_s = scan_timeout_s
         self.align_timestamps = align_timestamps
@@ -121,8 +124,9 @@ class XiaoBleClient:
             return device
 
         def match(device: BLEDevice, advertisement: AdvertisementData) -> bool:
-            if device.name == self.device_name:
-                return True
+            for name in (device.name, advertisement.local_name):
+                if name == self.device_name:
+                    return True
             service_uuids = {uuid.lower() for uuid in advertisement.service_uuids}
             return SERVICE_UUID.lower() in service_uuids
 
@@ -240,6 +244,11 @@ class XiaoBleClient:
                 samples[0].sequence,
                 samples[-1].sequence,
             )
+
+        if self.on_device_batch is not None:
+            result = self.on_device_batch(payload)
+            if asyncio.iscoroutine(result):
+                await result
 
         version = VERSION
         if self.align_timestamps:

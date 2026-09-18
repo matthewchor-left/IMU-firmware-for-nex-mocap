@@ -72,15 +72,19 @@ class ProxyStats:
             return None
         return time.monotonic() - self.last_batch_at
 
-    def format_summary(self) -> str:
+    def format_summary(self, transport: str = "ble") -> str:
         elapsed = max(time.monotonic() - self.session_started_at, 1e-6)
         batch_summary = ", ".join(
             f"{size}x{count}" for size, count in sorted(self.batch_sizes.items())
         )
-        expected_batch = batch_capacity_for_mtu(self.mtu)
+        if transport == "usb":
+            transport_info = "transport=usb expected_batch=16"
+        else:
+            expected_batch = batch_capacity_for_mtu(self.mtu)
+            transport_info = f"transport=ble mtu={self.mtu} expected_batch={expected_batch}"
         return (
-            f"mtu={self.mtu} expected_batch={expected_batch} "
-            f"ble={self.ble_batches / elapsed:.1f} batches/s "
+            f"{transport_info} "
+            f"input={self.ble_batches / elapsed:.1f} batches/s "
             f"{self.ble_samples / elapsed:.1f} samples/s "
             f"tcp_sent={self.tcp_frames_sent} "
             f"dropped_samples={self.dropped_samples} "

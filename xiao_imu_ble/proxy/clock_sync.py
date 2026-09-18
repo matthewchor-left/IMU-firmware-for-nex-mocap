@@ -7,10 +7,14 @@ import contextlib
 import logging
 import struct
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
+
+from .protocol import encode_usb_sync_request
 
 logger = logging.getLogger(__name__)
 
@@ -191,16 +195,16 @@ class DeviceClockMapper:
         self.offset_ns = fitted_offset
 
 
-class ClockSyncClient:
+class _SyncSend(Protocol):
+    async def __call__(self, request_id: int) -> None: ...
+
+
+class SyncSession:
     def __init__(
         self,
-        client: BleakClient,
-        sync_char: BleakGATTCharacteristic,
         mapper: DeviceClockMapper,
         ping_timeout_s: float = DEFAULT_PING_TIMEOUT_S,
     ) -> None:
-        self._client = client
-        self._sync_char = sync_char
         self._mapper = mapper
         self._ping_timeout_s = ping_timeout_s
         self._request_id = 0
@@ -212,11 +216,7 @@ class ClockSyncClient:
     def mapper(self) -> DeviceClockMapper:
         return self._mapper
 
-    def on_sync_notification(self, data: bytes) -> None:
-        if len(data) != 8:
-            return
-
-        request_id, device_ticks = struct.unpack("<II", data)
+    def handle_sync_response(self, request_id: int, device_ticks: int) -> None:
         pending = self._pending.pop(request_id, None)
         if pending is None:
             return
@@ -231,7 +231,7 @@ class ClockSyncClient:
         if not future.done():
             future.set_result(observation)
 
-    async def ping(self) -> SyncObservation | None:
+    async def ping(self, send_request: _SyncSend) -> SyncObservation | None:
         self._request_id = (self._request_id + 1) & 0xFFFFFFFF
         request_id = self._request_id
         loop = asyncio.get_running_loop()
@@ -240,14 +240,10 @@ class ClockSyncClient:
         self._pending[request_id] = (send_ns, future)
 
         try:
-            await self._client.write_gatt_char(
-                self._sync_char,
-                struct.pack("<I", request_id),
-                response=True,
-            )
+            await send_request(request_id)
         except Exception:
             self._pending.pop(request_id, None)
-            logger.exception("clock sync write failed for request %d", request_id)
+            logger.exception("clock sync request failed for id %d", request_id)
             return None
 
         try:
@@ -256,20 +252,21 @@ class ClockSyncClient:
             self._pending.pop(request_id, None)
             return None
 
-    async def run_burst(self, count: int, startup: bool = False) -> bool:
+    async def run_burst(self, count: int, send_request: _SyncSend, startup: bool = False) -> bool:
         observations: list[SyncObservation] = []
         for _ in range(count):
-            observation = await self.ping()
+            observation = await self.ping(send_request)
             if observation is not None:
                 observations.append(observation)
         return self._mapper.observe_burst(observations, startup=startup)
 
-    async def run_startup(self, ping_count: int = DEFAULT_STARTUP_PINGS) -> bool:
+    async def run_startup(self, count: int, send_request: _SyncSend) -> bool:
         self._mapper.reset()
-        return await self.run_burst(ping_count, startup=True)
+        return await SyncSession.run_burst(self, count, send_request, startup=True)
 
     async def start_periodic_refresh(
         self,
+        send_request: _SyncSend,
         ping_count: int = DEFAULT_REFRESH_PINGS,
         interval_s: float = DEFAULT_REFRESH_INTERVAL_S,
     ) -> None:
@@ -283,7 +280,9 @@ class ClockSyncClient:
                 except asyncio.TimeoutError:
                     if not self._mapper.calibrated:
                         continue
-                    if not await self.run_burst(ping_count, startup=False):
+                    if not await SyncSession.run_burst(
+                        self, ping_count, send_request, startup=False
+                    ):
                         logger.warning("periodic clock sync refresh failed")
 
         self._refresh_task = asyncio.create_task(refresh_loop(), name="clock-sync-refresh")
@@ -296,3 +295,83 @@ class ClockSyncClient:
         with contextlib.suppress(asyncio.CancelledError):
             await self._refresh_task
         self._refresh_task = None
+
+
+class BleClockSyncClient(SyncSession):
+    def __init__(
+        self,
+        client: BleakClient,
+        sync_char: BleakGATTCharacteristic,
+        mapper: DeviceClockMapper,
+        ping_timeout_s: float = DEFAULT_PING_TIMEOUT_S,
+    ) -> None:
+        super().__init__(mapper, ping_timeout_s=ping_timeout_s)
+        self._client = client
+        self._sync_char = sync_char
+
+    def on_sync_notification(self, data: bytes) -> None:
+        if len(data) != 8:
+            return
+        request_id, device_ticks = struct.unpack("<II", data)
+        self.handle_sync_response(request_id, device_ticks)
+
+    async def _send_ble(self, request_id: int) -> None:
+        await self._client.write_gatt_char(
+            self._sync_char,
+            struct.pack("<I", request_id),
+            response=True,
+        )
+
+    async def run_startup(self, ping_count: int = DEFAULT_STARTUP_PINGS) -> bool:
+        return await SyncSession.run_startup(self, ping_count, self._send_ble)
+
+    async def start_periodic_refresh(
+        self,
+        ping_count: int = DEFAULT_REFRESH_PINGS,
+        interval_s: float = DEFAULT_REFRESH_INTERVAL_S,
+    ) -> None:
+        await SyncSession.start_periodic_refresh(
+            self,
+            self._send_ble,
+            ping_count=ping_count,
+            interval_s=interval_s,
+        )
+
+
+class UsbClockSyncClient(SyncSession):
+    def __init__(
+        self,
+        mapper: DeviceClockMapper,
+        write_frame: Callable[[bytes], Awaitable[None]],
+        ping_timeout_s: float = DEFAULT_PING_TIMEOUT_S,
+    ) -> None:
+        super().__init__(mapper, ping_timeout_s=ping_timeout_s)
+        self._write_frame = write_frame
+
+    def on_sync_response_message(self, payload: bytes) -> None:
+        if len(payload) != 8:
+            return
+        request_id, device_ticks = struct.unpack("<II", payload)
+        self.handle_sync_response(request_id, device_ticks)
+
+    async def _send_usb(self, request_id: int) -> None:
+        await self._write_frame(encode_usb_sync_request(request_id))
+
+    async def run_startup(self, ping_count: int = DEFAULT_STARTUP_PINGS) -> bool:
+        return await SyncSession.run_startup(self, ping_count, self._send_usb)
+
+    async def start_periodic_refresh(
+        self,
+        ping_count: int = DEFAULT_REFRESH_PINGS,
+        interval_s: float = DEFAULT_REFRESH_INTERVAL_S,
+    ) -> None:
+        await SyncSession.start_periodic_refresh(
+            self,
+            self._send_usb,
+            ping_count=ping_count,
+            interval_s=interval_s,
+        )
+
+
+# Backward-compatible alias used by the BLE client.
+ClockSyncClient = BleClockSyncClient

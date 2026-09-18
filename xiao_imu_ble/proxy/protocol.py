@@ -7,16 +7,19 @@ from dataclasses import dataclass
 from typing import Iterable
 
 MAGIC = b"XIMU"
-VERSION = 1
-VERSION_ALIGNED = 2
-SAMPLE_SIZE = 29
-ALIGNED_SAMPLE_SIZE = 33
+VERSION = 2
+DEVICE_SAMPLE_SIZE = 29
+TCP_SAMPLE_SIZE = 33
 HEADER_SIZE = 7  # magic(4) + version(1) + sample_count(2)
 USB_HEADER_SIZE = 8  # magic(4) + version(1) + msg_type(1) + payload_len(2)
 USB_MSG_IMU_BATCH = 0x01
 USB_MSG_SYNC_REQ = 0x02
 USB_MSG_SYNC_RESP = 0x03
 USB_BATCH_CAPACITY = 16
+
+# Backward-compatible aliases for device-side parsing.
+SAMPLE_SIZE = DEVICE_SAMPLE_SIZE
+ALIGNED_SAMPLE_SIZE = TCP_SAMPLE_SIZE
 
 SERVICE_UUID = "bfe2b6e1-0003-4583-926c-c39f476f7a34"
 IMU_CHAR_UUID = "bfe2b6e1-0004-4583-926c-c39f476f7a34"
@@ -37,7 +40,7 @@ class ImuSample:
 
 
 @dataclass(frozen=True, slots=True)
-class AlignedImuSample:
+class TcpImuSample:
     host_timestamp_us: int
     sequence: int
     gx: float
@@ -48,18 +51,15 @@ class AlignedImuSample:
     az: float
 
 
-def sample_size_for_version(version: int) -> int:
-    if version == VERSION:
-        return SAMPLE_SIZE
-    if version == VERSION_ALIGNED:
-        return ALIGNED_SAMPLE_SIZE
-    raise ValueError(f"unsupported protocol version: {version}")
+# Backward-compatible alias.
+AlignedImuSample = TcpImuSample
 
 
-def parse_sample(data: bytes, offset: int = 0) -> ImuSample:
-    if len(data) < offset + SAMPLE_SIZE:
+def parse_device_sample(data: bytes, offset: int = 0) -> ImuSample:
+    if len(data) < offset + DEVICE_SAMPLE_SIZE:
         raise ValueError(
-            f"need at least {SAMPLE_SIZE} bytes at offset {offset}, got {len(data) - offset}"
+            f"need at least {DEVICE_SAMPLE_SIZE} bytes at offset {offset}, "
+            f"got {len(data) - offset}"
         )
 
     timestamp_us, = struct.unpack_from("<I", data, offset)
@@ -68,46 +68,84 @@ def parse_sample(data: bytes, offset: int = 0) -> ImuSample:
     return ImuSample(timestamp_us, sequence, gx, gy, gz, ax, ay, az)
 
 
+def parse_sample(data: bytes, offset: int = 0) -> ImuSample:
+    return parse_device_sample(data, offset)
+
+
 def parse_samples(payload: bytes) -> list[ImuSample]:
-    if len(payload) % SAMPLE_SIZE != 0:
-        raise ValueError(f"payload length {len(payload)} is not a multiple of {SAMPLE_SIZE}")
-
-    return [parse_sample(payload, offset) for offset in range(0, len(payload), SAMPLE_SIZE)]
-
-
-def parse_aligned_sample(data: bytes, offset: int = 0) -> AlignedImuSample:
-    if len(data) < offset + ALIGNED_SAMPLE_SIZE:
+    if len(payload) % DEVICE_SAMPLE_SIZE != 0:
         raise ValueError(
-            f"need at least {ALIGNED_SAMPLE_SIZE} bytes at offset {offset}, got {len(data) - offset}"
+            f"payload length {len(payload)} is not a multiple of {DEVICE_SAMPLE_SIZE}"
+        )
+
+    return [
+        parse_device_sample(payload, offset)
+        for offset in range(0, len(payload), DEVICE_SAMPLE_SIZE)
+    ]
+
+
+def parse_tcp_sample(data: bytes, offset: int = 0) -> TcpImuSample:
+    if len(data) < offset + TCP_SAMPLE_SIZE:
+        raise ValueError(
+            f"need at least {TCP_SAMPLE_SIZE} bytes at offset {offset}, "
+            f"got {len(data) - offset}"
         )
 
     host_timestamp_us, = struct.unpack_from("<Q", data, offset)
     sequence = data[offset + 8]
     gx, gy, gz, ax, ay, az = struct.unpack_from("<6f", data, offset + 9)
-    return AlignedImuSample(host_timestamp_us, sequence, gx, gy, gz, ax, ay, az)
+    return TcpImuSample(host_timestamp_us, sequence, gx, gy, gz, ax, ay, az)
 
 
-def parse_aligned_samples(payload: bytes) -> list[AlignedImuSample]:
-    if len(payload) % ALIGNED_SAMPLE_SIZE != 0:
+def parse_aligned_sample(data: bytes, offset: int = 0) -> TcpImuSample:
+    return parse_tcp_sample(data, offset)
+
+
+def parse_tcp_samples(payload: bytes) -> list[TcpImuSample]:
+    if len(payload) % TCP_SAMPLE_SIZE != 0:
         raise ValueError(
-            f"payload length {len(payload)} is not a multiple of {ALIGNED_SAMPLE_SIZE}"
+            f"payload length {len(payload)} is not a multiple of {TCP_SAMPLE_SIZE}"
         )
 
     return [
-        parse_aligned_sample(payload, offset)
-        for offset in range(0, len(payload), ALIGNED_SAMPLE_SIZE)
+        parse_tcp_sample(payload, offset)
+        for offset in range(0, len(payload), TCP_SAMPLE_SIZE)
     ]
+
+
+def parse_aligned_samples(payload: bytes) -> list[TcpImuSample]:
+    return parse_tcp_samples(payload)
+
+
+def encode_tcp_payload(samples: list[TcpImuSample]) -> bytes:
+    payload = bytearray(len(samples) * TCP_SAMPLE_SIZE)
+    for index, sample in enumerate(samples):
+        offset = index * TCP_SAMPLE_SIZE
+        struct.pack_into(
+            "<QB6f",
+            payload,
+            offset,
+            sample.host_timestamp_us,
+            sample.sequence,
+            sample.gx,
+            sample.gy,
+            sample.gz,
+            sample.ax,
+            sample.ay,
+            sample.az,
+        )
+    return bytes(payload)
 
 
 def build_aligned_payload(device_payload: bytes, mapper) -> bytes:
     samples = parse_samples(device_payload)
-    payload = bytearray(len(samples) * ALIGNED_SAMPLE_SIZE)
+    payload = bytearray(len(samples) * TCP_SAMPLE_SIZE)
     for index, sample in enumerate(samples):
         host_timestamp_us = mapper.map_device_us(sample.timestamp_us)
         if host_timestamp_us is None:
             raise RuntimeError("clock mapper is not calibrated")
 
-        offset = index * ALIGNED_SAMPLE_SIZE
+        offset = index * TCP_SAMPLE_SIZE
         struct.pack_into(
             "<QB6f",
             payload,
@@ -138,16 +176,17 @@ def encode_usb_sync_request(request_id: int) -> bytes:
     return encode_usb_frame(USB_MSG_SYNC_REQ, struct.pack("<I", request_id))
 
 
-def encode_frame(payload: bytes, version: int = VERSION) -> bytes:
-    sample_size = sample_size_for_version(version)
-    if len(payload) % sample_size != 0:
-        raise ValueError(f"payload length {len(payload)} is not a multiple of {sample_size}")
+def encode_frame(payload: bytes) -> bytes:
+    if len(payload) % TCP_SAMPLE_SIZE != 0:
+        raise ValueError(
+            f"payload length {len(payload)} is not a multiple of {TCP_SAMPLE_SIZE}"
+        )
 
-    sample_count = len(payload) // sample_size
+    sample_count = len(payload) // TCP_SAMPLE_SIZE
     if sample_count > 0xFFFF:
         raise ValueError(f"too many samples in one frame: {sample_count}")
 
-    return MAGIC + struct.pack("<BH", version, sample_count) + payload
+    return MAGIC + struct.pack("<BH", VERSION, sample_count) + payload
 
 
 def sequence_gap(previous: int | None, current: int) -> int | None:
@@ -167,8 +206,7 @@ def sequence_gap(previous: int | None, current: int) -> int | None:
 
 @dataclass(slots=True)
 class Frame:
-    version: int
-    samples: list[ImuSample] | list[AlignedImuSample]
+    samples: list[TcpImuSample]
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,29 +279,24 @@ class FrameStream:
                     break
 
             version = self._buffer[4]
-            sample_count = int.from_bytes(self._buffer[5:7], "little")
-            try:
-                sample_size = sample_size_for_version(version)
-            except ValueError:
+            if version != VERSION:
                 del self._buffer[:4]
                 continue
 
-            frame_len = HEADER_SIZE + sample_count * sample_size
+            sample_count = int.from_bytes(self._buffer[5:7], "little")
+            frame_len = HEADER_SIZE + sample_count * TCP_SAMPLE_SIZE
             if len(self._buffer) < frame_len:
                 break
 
             payload = bytes(self._buffer[HEADER_SIZE:frame_len])
             del self._buffer[:frame_len]
-            if version == VERSION_ALIGNED:
-                frames.append(Frame(version=version, samples=parse_aligned_samples(payload)))
-            else:
-                frames.append(Frame(version=version, samples=parse_samples(payload)))
+            frames.append(Frame(samples=parse_tcp_samples(payload)))
 
         return frames
 
 
 def dropped_samples_in_batch(
-    previous: int | None, samples: Iterable[ImuSample]
+    previous: int | None, samples: Iterable[ImuSample | TcpImuSample]
 ) -> tuple[int | None, int]:
     """Update sequence tracker and return (new_previous, total_dropped)."""
     dropped = 0

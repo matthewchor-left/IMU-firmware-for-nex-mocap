@@ -8,35 +8,48 @@ import contextlib
 import logging
 import sys
 import time
-from typing import TextIO
+from typing import Protocol, TextIO
 
-from .ble_client import XiaoBleClient
 from .clock_sync import DEFAULT_REFRESH_INTERVAL_S, DEFAULT_REFRESH_PINGS, DEFAULT_STARTUP_PINGS
 from .protocol import (
     DEFAULT_DEVICE_NAME,
     ImuSample,
-    VERSION,
-    encode_frame,
     parse_aligned_samples,
-    parse_samples,
 )
-from .dual_client import DualImuClient
+from .mock_client import DEFAULT_MOCK_BATCH_SIZE, DEFAULT_MOCK_RATE_HZ, MockImuClient
+from .rebatch import TcpRebatcher
 from .stats import ProxyStats
-from .usb_client import UsbImuClient
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
+DEFAULT_SERIAL_PORT = "auto"
 QUEUE_CAPACITY = 256
 DEFAULT_STATS_INTERVAL_S = 5.0
 DEFAULT_IDLE_WARN_S = 3.0
+DEFAULT_REBATCH_SAMPLES = 0
+DEFAULT_REBATCH_MS = 50.0
+
+
+class InputClient(Protocol):
+    async def run(self) -> None: ...
+
+    async def stop(self) -> None: ...
 
 
 class TcpBroadcaster:
-    def __init__(self, host: str, port: int, stats: ProxyStats) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        stats: ProxyStats,
+        *,
+        rebatch_samples: int = DEFAULT_REBATCH_SAMPLES,
+        rebatch_ms: float = DEFAULT_REBATCH_MS,
+    ) -> None:
         self.host = host
         self.port = port
         self.stats = stats
+        self._rebatcher = TcpRebatcher(rebatch_samples, rebatch_ms / 1000.0)
         self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=QUEUE_CAPACITY)
         self._server: asyncio.Server | None = None
         self._client_writer: asyncio.StreamWriter | None = None
@@ -62,26 +75,30 @@ class TcpBroadcaster:
     def reset_session(self, mtu: int = 0) -> None:
         self.stats.reset_session(mtu)
 
-    async def publish_batch(self, payload: bytes, version: int) -> None:
-        if version == VERSION:
-            samples = parse_samples(payload)
-        else:
-            samples = [
-                ImuSample(
-                    sample.host_timestamp_us,
-                    sample.sequence,
-                    sample.gx,
-                    sample.gy,
-                    sample.gz,
-                    sample.ax,
-                    sample.ay,
-                    sample.az,
-                )
-                for sample in parse_aligned_samples(payload)
-            ]
+    async def publish_batch(self, payload: bytes) -> None:
+        samples = [
+            ImuSample(
+                sample.host_timestamp_us,
+                sample.sequence,
+                sample.gx,
+                sample.gy,
+                sample.gz,
+                sample.ax,
+                sample.ay,
+                sample.az,
+            )
+            for sample in parse_aligned_samples(payload)
+        ]
         self.stats.record_ble_batch(samples)
 
-        frame = encode_frame(payload, version=version)
+        for frame in self._rebatcher.ingest(payload):
+            self._enqueue_frame(frame)
+
+    async def flush_rebatch(self) -> None:
+        for frame in self._rebatcher.flush():
+            self._enqueue_frame(frame)
+
+    def _enqueue_frame(self, frame: bytes) -> None:
         try:
             self._queue.put_nowait(frame)
         except asyncio.QueueFull:
@@ -103,6 +120,8 @@ class TcpBroadcaster:
             try:
                 frame = await asyncio.wait_for(self._queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
+                for stale_frame in self._rebatcher.flush_if_stale():
+                    self._enqueue_frame(stale_frame)
                 continue
 
             writer = self._client_writer
@@ -183,6 +202,8 @@ async def run_stats_reporter(
                     "no IMU batches received for %.1f s (check USB cable and serial port)",
                     idle_for,
                 )
+            elif transport == "mock":
+                logging.warning("no mock IMU batches generated for %.1f s", idle_for)
             else:
                 logging.warning(
                     "no IMU batches received for %.1f s (check BLE link and MTU)",
@@ -193,6 +214,8 @@ async def run_stats_reporter(
                 logging.warning(
                     "no IMU batches received since USB session started (check serial port)"
                 )
+            elif transport == "mock":
+                logging.warning("no mock IMU batches generated since session started")
             else:
                 logging.warning(
                     "no IMU batches received since BLE session started (check MTU and device link)"
@@ -204,8 +227,25 @@ async def run_proxy(args: argparse.Namespace) -> None:
     tcp_stats = ProxyStats()
     ble_stats = ProxyStats()
     usb_stats = ProxyStats()
-    broadcaster = TcpBroadcaster(args.host, args.port, tcp_stats)
-    input_client: XiaoBleClient | UsbImuClient | DualImuClient
+    if args.mock_rate <= 0:
+        raise SystemExit("--mock-rate must be greater than zero")
+    if not 1 <= args.mock_batch_size <= 0xFFFF:
+        raise SystemExit("--mock-batch-size must be between 1 and 65535")
+
+    broadcaster = TcpBroadcaster(
+        args.host,
+        args.port,
+        tcp_stats,
+        rebatch_samples=args.rebatch,
+        rebatch_ms=args.rebatch_ms,
+    )
+    if args.rebatch > 0:
+        logging.info(
+            "TCP rebatch enabled: target=%d samples, max_wait=%.0f ms",
+            args.rebatch,
+            args.rebatch_ms,
+        )
+    input_client: InputClient
 
     def on_session_start_mtu(mtu: int) -> None:
         tcp_stats.reset_session(mtu)
@@ -213,9 +253,16 @@ async def run_proxy(args: argparse.Namespace) -> None:
     def on_session_start_usb() -> None:
         tcp_stats.reset_session(0)
 
-    if args.transport == "dual":
-        if args.raw_timestamps:
-            raise SystemExit("dual transport requires host-aligned timestamps")
+    if args.transport == "mock":
+        tcp_stats.reset_session(0)
+        input_client = MockImuClient(
+            on_batch=broadcaster.publish_batch,
+            sample_rate_hz=args.mock_rate,
+            batch_size=args.mock_batch_size,
+        )
+    elif args.transport == "dual":
+        from .dual_client import DualImuClient
+
         input_client = DualImuClient(
             ble_device_name=args.device_name,
             ble_address=args.address,
@@ -226,31 +273,32 @@ async def run_proxy(args: argparse.Namespace) -> None:
             ble_stats=ble_stats,
             usb_stats=usb_stats,
             scan_timeout_s=args.scan_timeout,
-            align_timestamps=True,
             startup_sync_pings=args.sync_pings,
             refresh_sync_pings=args.sync_refresh_pings,
             refresh_interval_s=args.sync_refresh_interval,
             compare_interval_s=args.stats_interval if args.stats_interval > 0 else 5.0,
         )
     elif args.transport == "usb":
+        from .usb_client import UsbImuClient
+
         input_client = UsbImuClient(
             port=args.serial,
             baudrate=args.baudrate,
             on_batch=broadcaster.publish_batch,
             on_session_start=on_session_start_usb,
-            align_timestamps=not args.raw_timestamps,
             startup_sync_pings=args.sync_pings,
             refresh_sync_pings=args.sync_refresh_pings,
             refresh_interval_s=args.sync_refresh_interval,
         )
     else:
+        from .ble_client import XiaoBleClient
+
         input_client = XiaoBleClient(
             device_name=args.device_name,
             address=args.address,
             on_batch=broadcaster.publish_batch,
             on_session_start=on_session_start_mtu,
             scan_timeout_s=args.scan_timeout,
-            align_timestamps=not args.raw_timestamps,
             startup_sync_pings=args.sync_pings,
             refresh_sync_pings=args.sync_refresh_pings,
             refresh_interval_s=args.sync_refresh_interval,
@@ -280,6 +328,7 @@ async def run_proxy(args: argparse.Namespace) -> None:
     finally:
         stop_event.set()
         await input_client.stop()
+        await broadcaster.flush_rebatch()
         await broadcaster.stop()
         sender_task.cancel()
         if stats_task is not None:
@@ -298,11 +347,14 @@ async def run_proxy(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Receive XiaoIMU batches over BLE or USB and expose them on a localhost TCP port.",
+        description=(
+            "Receive XiaoIMU batches over BLE, USB, or a mock source and expose "
+            "them on a localhost TCP port."
+        ),
     )
     parser.add_argument(
         "--transport",
-        choices=("ble", "usb", "dual"),
+        choices=("ble", "usb", "dual", "mock"),
         default="ble",
         help="input transport",
     )
@@ -317,13 +369,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--serial",
         default=DEFAULT_SERIAL_PORT,
-        help="USB serial port for --transport usb",
+        help="USB serial port, or 'auto' to detect the Xiao (default)",
     )
     parser.add_argument(
         "--baudrate",
         type=int,
         default=115200,
         help="USB serial baud rate",
+    )
+    parser.add_argument(
+        "--mock-rate",
+        type=float,
+        default=DEFAULT_MOCK_RATE_HZ,
+        help="mock samples per second (default: 208)",
+    )
+    parser.add_argument(
+        "--mock-batch-size",
+        type=int,
+        default=DEFAULT_MOCK_BATCH_SIZE,
+        help="samples per generated mock batch (default: 6)",
     )
     parser.add_argument(
         "--device-name",
@@ -353,11 +417,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="warn if no IMU batches arrive for this many seconds",
     )
     parser.add_argument(
-        "--raw-timestamps",
-        action="store_true",
-        help="skip clock sync and forward raw device timestamps (protocol v1)",
-    )
-    parser.add_argument(
         "--sync-pings",
         type=int,
         default=DEFAULT_STARTUP_PINGS,
@@ -374,6 +433,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_REFRESH_INTERVAL_S,
         help="seconds between periodic clock-sync refresh bursts",
+    )
+    parser.add_argument(
+        "--rebatch",
+        type=int,
+        default=DEFAULT_REBATCH_SAMPLES,
+        help="merge device batches into TCP frames of this many samples (0 disables)",
+    )
+    parser.add_argument(
+        "--rebatch-ms",
+        type=float,
+        default=DEFAULT_REBATCH_MS,
+        help="flush a partial TCP batch after this many milliseconds when rebatching",
     )
     parser.add_argument("--verbose", action="store_true", help="enable debug logging")
     return parser

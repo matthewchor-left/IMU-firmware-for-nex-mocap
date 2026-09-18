@@ -79,6 +79,8 @@ class ProxyStats:
         )
         if transport == "usb":
             transport_info = "transport=usb expected_batch=16"
+        elif transport == "mock":
+            transport_info = "transport=mock"
         else:
             expected_batch = batch_capacity_for_mtu(self.mtu)
             transport_info = f"transport=ble mtu={self.mtu} expected_batch={expected_batch}"

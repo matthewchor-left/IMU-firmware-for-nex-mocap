@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from collections.abc import Awaitable, Callable
 
 import serial
 from serial.serialutil import SerialException
+from serial.tools import list_ports
 
 from .clock_sync import (
     DEFAULT_REFRESH_INTERVAL_S,
@@ -20,8 +22,6 @@ from .clock_sync import (
 from .protocol import (
     USB_MSG_IMU_BATCH,
     USB_MSG_SYNC_RESP,
-    VERSION,
-    VERSION_ALIGNED,
     UsbFrameStream,
     UsbMessage,
     build_aligned_payload,
@@ -30,9 +30,56 @@ from .protocol import (
 
 logger = logging.getLogger(__name__)
 
-OnBatchCallback = Callable[[bytes, int], Awaitable[None] | None]
+XIAO_USB_VID = 0x2886
+XIAO_USB_PID = 0x8045
+AUTO_SERIAL_PORT = "auto"
+
+OnBatchCallback = Callable[[bytes], Awaitable[None] | None]
 OnDeviceBatchCallback = Callable[[bytes], Awaitable[None] | None]
 OnSessionCallback = Callable[[], Awaitable[None] | None]
+
+
+def find_xiao_serial_port() -> str | None:
+    for info in list_ports.comports():
+        if info.vid == XIAO_USB_VID and info.pid == XIAO_USB_PID:
+            return info.device
+        description = (info.description or "").upper()
+        if "XIAO" in description and "NRF52840" in description:
+            return info.device
+    return None
+
+
+def list_acm_ports() -> list[str]:
+    return sorted(
+        info.device
+        for info in list_ports.comports()
+        if info.device.startswith("/dev/ttyACM")
+    )
+
+
+def resolve_usb_port(port: str) -> str:
+    if port == AUTO_SERIAL_PORT:
+        detected = find_xiao_serial_port()
+        if detected is None:
+            acm_ports = list_acm_ports()
+            available = ", ".join(acm_ports) if acm_ports else "none"
+            raise SerialException(
+                f"no Xiao serial port found (ACM ports: {available})"
+            )
+        logger.info("auto-detected Xiao serial port %s", detected)
+        return detected
+
+    if os.path.exists(port):
+        return port
+
+    detected = find_xiao_serial_port()
+    if detected is not None:
+        logger.warning("%s not found; using auto-detected %s", port, detected)
+        return detected
+
+    acm_ports = list_acm_ports()
+    available = ", ".join(acm_ports) if acm_ports else "none"
+    raise SerialException(f"serial port {port} not found (ACM ports: {available})")
 
 
 class UsbImuClient:
@@ -46,7 +93,6 @@ class UsbImuClient:
         on_session_start: OnSessionCallback | None = None,
         read_size: int = 4096,
         reconnect_delay_s: float = 1.0,
-        align_timestamps: bool = True,
         startup_sync_pings: int = DEFAULT_STARTUP_PINGS,
         refresh_sync_pings: int = DEFAULT_REFRESH_PINGS,
         refresh_interval_s: float = DEFAULT_REFRESH_INTERVAL_S,
@@ -58,7 +104,6 @@ class UsbImuClient:
         self.on_session_start = on_session_start
         self.read_size = read_size
         self.reconnect_delay_s = reconnect_delay_s
-        self.align_timestamps = align_timestamps
         self.startup_sync_pings = startup_sync_pings
         self.refresh_sync_pings = refresh_sync_pings
         self.refresh_interval_s = refresh_interval_s
@@ -77,13 +122,14 @@ class UsbImuClient:
 
         while not self._stop.is_set():
             try:
-                logger.info("opening USB serial port %s", self.port)
-                await self._read_loop()
+                port = resolve_usb_port(self.port)
+                logger.info("opening USB serial port %s", port)
+                await self._read_loop(port)
                 backoff_s = self.reconnect_delay_s
             except asyncio.CancelledError:
                 raise
-            except SerialException:
-                logger.exception("USB serial session ended")
+            except SerialException as exc:
+                logger.error("USB serial session ended: %s", exc)
             except Exception:
                 logger.exception("USB reader failed")
             finally:
@@ -144,15 +190,15 @@ class UsbImuClient:
 
             await self._process_messages(stream.feed(chunk), clock_sync)
 
-    async def _read_loop(self) -> None:
+    async def _read_loop(self, port: str) -> None:
         stream = UsbFrameStream()
 
         with serial.Serial(
-            self.port,
+            port,
             baudrate=self.baudrate,
             timeout=0.1,
         ) as ser:
-            logger.info("USB serial connected (%s @ %d)", self.port, self.baudrate)
+            logger.info("USB serial connected (%s @ %d)", port, self.baudrate)
 
             async def write_frame(frame: bytes) -> None:
                 await asyncio.to_thread(ser.write, frame)
@@ -173,20 +219,17 @@ class UsbImuClient:
                     if asyncio.iscoroutine(result):
                         await result
 
-                if self.align_timestamps:
-                    logger.info(
-                        "running USB startup clock sync (%d pings)",
-                        self.startup_sync_pings,
-                    )
-                    if not await clock_sync.run_startup(self.startup_sync_pings):
-                        raise RuntimeError("USB startup clock sync failed")
-                    await clock_sync.start_periodic_refresh(
-                        ping_count=self.refresh_sync_pings,
-                        interval_s=self.refresh_interval_s,
-                    )
-                    logger.info("USB clock sync ready; streaming host-aligned timestamps")
-                else:
-                    logger.info("using raw device timestamps over USB (protocol v1)")
+                logger.info(
+                    "running USB startup clock sync (%d pings)",
+                    self.startup_sync_pings,
+                )
+                if not await clock_sync.run_startup(self.startup_sync_pings):
+                    raise RuntimeError("USB startup clock sync failed")
+                await clock_sync.start_periodic_refresh(
+                    ping_count=self.refresh_sync_pings,
+                    interval_s=self.refresh_interval_s,
+                )
+                logger.info("USB clock sync ready; streaming")
 
                 self._streaming = True
                 await reader_task
@@ -215,18 +258,15 @@ class UsbImuClient:
             if asyncio.iscoroutine(result):
                 await result
 
-        version = VERSION
-        if self.align_timestamps:
-            mapper = self.clock_mapper
-            if mapper is None or not mapper.calibrated:
-                return
-            try:
-                payload = build_aligned_payload(payload, mapper)
-            except RuntimeError:
-                logger.warning("dropping USB batch because clock mapper is not calibrated")
-                return
-            version = VERSION_ALIGNED
+        mapper = self.clock_mapper
+        if mapper is None or not mapper.calibrated:
+            return
+        try:
+            payload = build_aligned_payload(payload, mapper)
+        except RuntimeError:
+            logger.warning("dropping USB batch because clock mapper is not calibrated")
+            return
 
-        result = self.on_batch(payload, version)
+        result = self.on_batch(payload)
         if asyncio.iscoroutine(result):
             await result

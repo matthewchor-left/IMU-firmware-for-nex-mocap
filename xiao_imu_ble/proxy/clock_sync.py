@@ -9,10 +9,11 @@ import struct
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from bleak import BleakClient
-from bleak.backends.characteristic import BleakGATTCharacteristic
+if TYPE_CHECKING:
+    from bleak import BleakClient
+    from bleak.backends.characteristic import BleakGATTCharacteristic
 
 from .protocol import encode_usb_sync_request
 

@@ -8,7 +8,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-from .protocol import VERSION_ALIGNED, Frame, FrameStream, dropped_samples_in_batch
+from .protocol import Frame, FrameStream, TcpImuSample, dropped_samples_in_batch
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -21,8 +21,7 @@ class StreamStats:
     bytes_received: int = 0
     dropped_samples: int = 0
     last_sequence: int | None = None
-    last_sample: object | None = None
-    last_protocol_version: int | None = None
+    last_sample: TcpImuSample | None = None
     batch_sizes: dict[int, int] = field(default_factory=dict)
 
     def record_frame(self, frame: Frame) -> None:
@@ -30,7 +29,6 @@ class StreamStats:
         count = len(frame.samples)
         self.samples += count
         self.batch_sizes[count] = self.batch_sizes.get(count, 0) + 1
-        self.last_protocol_version = frame.version
 
         self.last_sequence, dropped = dropped_samples_in_batch(
             self.last_sequence,
@@ -40,13 +38,9 @@ class StreamStats:
         self.last_sample = frame.samples[-1]
 
 
-def format_sample(sample: object, version: int | None) -> str:
-    if version == VERSION_ALIGNED:
-        timestamp = f"host_ts={sample.host_timestamp_us}"
-    else:
-        timestamp = f"device_ts={sample.timestamp_us}"
+def format_sample(sample: TcpImuSample) -> str:
     return (
-        f"{timestamp} seq={sample.sequence} "
+        f"host_ts={sample.host_timestamp_us} seq={sample.sequence} "
         f"g=({sample.gx:7.2f},{sample.gy:7.2f},{sample.gz:7.2f}) "
         f"a=({sample.ax:6.2f},{sample.ay:6.2f},{sample.az:6.2f})"
     )
@@ -60,19 +54,10 @@ def print_stats(stats: StreamStats, elapsed_s: float) -> None:
         f"{size}x{n}" for size, n in sorted(stats.batch_sizes.items())
     )
     last = stats.last_sample
-    version_label = (
-        f"v{stats.last_protocol_version}"
-        if stats.last_protocol_version is not None
-        else "v?"
-    )
-    last_line = (
-        format_sample(last, stats.last_protocol_version)
-        if last is not None
-        else "no samples yet"
-    )
+    last_line = format_sample(last) if last is not None else "no samples yet"
 
     print(
-        f"[{elapsed_s:5.1f}s] {version_label} "
+        f"[{elapsed_s:5.1f}s] v2 "
         f"{stats.frames / elapsed_s:6.1f} frames/s, "
         f"{stats.samples / elapsed_s:7.1f} samples/s, "
         f"{stats.bytes_received / elapsed_s:8.0f} B/s, "
@@ -120,7 +105,7 @@ def run_consumer(args: argparse.Namespace) -> int:
                 stats.record_frame(frame)
                 if args.print_samples:
                     for sample in frame.samples:
-                        print(format_sample(sample, frame.version))
+                        print(format_sample(sample))
 
             now = time.monotonic()
             if now - last_report >= args.stats_interval:

@@ -23,8 +23,6 @@ from .protocol import (
     IMU_CHAR_UUID,
     SERVICE_UUID,
     SYNC_CHAR_UUID,
-    VERSION,
-    VERSION_ALIGNED,
     build_aligned_payload,
     parse_samples,
 )
@@ -32,7 +30,7 @@ from .stats import batch_capacity_for_mtu
 
 logger = logging.getLogger(__name__)
 
-OnBatchCallback = Callable[[bytes, int], Awaitable[None] | None]
+OnBatchCallback = Callable[[bytes], Awaitable[None] | None]
 OnDeviceBatchCallback = Callable[[bytes], Awaitable[None] | None]
 OnSessionCallback = Callable[[int], Awaitable[None] | None]
 
@@ -55,7 +53,6 @@ class XiaoBleClient:
         on_device_batch: OnDeviceBatchCallback | None = None,
         on_session_start: OnSessionCallback | None = None,
         scan_timeout_s: float = 10.0,
-        align_timestamps: bool = True,
         startup_sync_pings: int = DEFAULT_STARTUP_PINGS,
         refresh_sync_pings: int = DEFAULT_REFRESH_PINGS,
         refresh_interval_s: float = DEFAULT_REFRESH_INTERVAL_S,
@@ -66,7 +63,6 @@ class XiaoBleClient:
         self.on_device_batch = on_device_batch
         self.on_session_start = on_session_start
         self.scan_timeout_s = scan_timeout_s
-        self.align_timestamps = align_timestamps
         self.startup_sync_pings = startup_sync_pings
         self.refresh_sync_pings = refresh_sync_pings
         self.refresh_interval_s = refresh_interval_s
@@ -201,17 +197,14 @@ class XiaoBleClient:
             await client.start_notify(imu_char, on_imu)
             logger.info("BLE notifications enabled")
 
-            if self.align_timestamps:
-                logger.info("running startup clock sync (%d pings)", self.startup_sync_pings)
-                if not await clock_sync.run_startup(self.startup_sync_pings):
-                    raise RuntimeError("startup clock sync failed")
-                await clock_sync.start_periodic_refresh(
-                    ping_count=self.refresh_sync_pings,
-                    interval_s=self.refresh_interval_s,
-                )
-                logger.info("clock sync ready; starting IMU stream with host-aligned timestamps")
-            else:
-                logger.info("using raw device timestamps (protocol v1)")
+            logger.info("running startup clock sync (%d pings)", self.startup_sync_pings)
+            if not await clock_sync.run_startup(self.startup_sync_pings):
+                raise RuntimeError("startup clock sync failed")
+            await clock_sync.start_periodic_refresh(
+                ping_count=self.refresh_sync_pings,
+                interval_s=self.refresh_interval_s,
+            )
+            logger.info("clock sync ready; starting IMU stream")
 
             self._streaming = True
             if batch_capacity == 0:
@@ -250,19 +243,16 @@ class XiaoBleClient:
             if asyncio.iscoroutine(result):
                 await result
 
-        version = VERSION
-        if self.align_timestamps:
-            mapper = self.clock_mapper
-            if mapper is None or not mapper.calibrated:
-                return
-            try:
-                payload = build_aligned_payload(payload, mapper)
-            except RuntimeError:
-                logger.warning("dropping batch because clock mapper is not calibrated")
-                return
-            version = VERSION_ALIGNED
+        mapper = self.clock_mapper
+        if mapper is None or not mapper.calibrated:
+            return
+        try:
+            payload = build_aligned_payload(payload, mapper)
+        except RuntimeError:
+            logger.warning("dropping batch because clock mapper is not calibrated")
+            return
 
-        result = self.on_batch(payload, version)
+        result = self.on_batch(payload)
         if asyncio.iscoroutine(result):
             await result
 

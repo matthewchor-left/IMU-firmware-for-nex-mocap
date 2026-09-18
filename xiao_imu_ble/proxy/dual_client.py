@@ -16,7 +16,7 @@ from .usb_client import UsbImuClient
 
 logger = logging.getLogger(__name__)
 
-OnBatchCallback = Callable[[bytes, int], Awaitable[None] | None]
+OnBatchCallback = Callable[[bytes], Awaitable[None] | None]
 
 
 class DualImuClient:
@@ -32,7 +32,6 @@ class DualImuClient:
         ble_stats: ProxyStats,
         usb_stats: ProxyStats,
         scan_timeout_s: float = 10.0,
-        align_timestamps: bool = True,
         startup_sync_pings: int = DEFAULT_STARTUP_PINGS,
         refresh_sync_pings: int = DEFAULT_REFRESH_PINGS,
         refresh_interval_s: float = DEFAULT_REFRESH_INTERVAL_S,
@@ -55,7 +54,6 @@ class DualImuClient:
             on_device_batch=self._on_ble_device_batch,
             on_session_start=self._on_ble_session_start,
             scan_timeout_s=scan_timeout_s,
-            align_timestamps=align_timestamps,
             startup_sync_pings=startup_sync_pings,
             refresh_sync_pings=refresh_sync_pings,
             refresh_interval_s=refresh_interval_s,
@@ -66,17 +64,12 @@ class DualImuClient:
             on_batch=self._on_usb_batch,
             on_device_batch=self._on_usb_device_batch,
             on_session_start=self._on_usb_session_start,
-            align_timestamps=align_timestamps,
             startup_sync_pings=startup_sync_pings,
             refresh_sync_pings=refresh_sync_pings,
             refresh_interval_s=refresh_interval_s,
         )
 
     async def run(self) -> None:
-        logger.info(
-            "dual mode requires xiaoblesense_dual firmware "
-            "(pio run -e xiaoblesense_dual --target upload)"
-        )
         compare_task = asyncio.create_task(self._compare_loop(), name="dual-compare")
         ble_task = asyncio.create_task(self._ble_client.run(), name="dual-ble")
         usb_task = asyncio.create_task(self._usb_client.run(), name="dual-usb")
@@ -113,13 +106,13 @@ class DualImuClient:
         self.usb_stats.record_ble_batch(parse_samples(payload))
         self._verifier.ingest_usb(payload, self._usb_client.clock_mapper)
 
-    async def _on_ble_batch(self, payload: bytes, version: int) -> None:
+    async def _on_ble_batch(self, payload: bytes) -> None:
         if self.tcp_source == "ble":
-            await self._on_batch(payload, version)
+            await self._on_batch(payload)
 
-    async def _on_usb_batch(self, payload: bytes, version: int) -> None:
+    async def _on_usb_batch(self, payload: bytes) -> None:
         if self.tcp_source == "usb":
-            await self._on_batch(payload, version)
+            await self._on_batch(payload)
 
     def _maybe_log_firmware_hint(self) -> None:
         if self._firmware_hint_logged:
@@ -129,10 +122,8 @@ class DualImuClient:
 
         self._firmware_hint_logged = True
         logger.warning(
-            "USB is streaming but BLE has not received any samples. "
-            "Dual verification needs both transports: flash "
-            "pio run -e xiaoblesense_dual --target upload "
-            "(USB-only firmware does not advertise as '%s')",
+            "USB is streaming but BLE has not received any samples "
+            "(check that BLE is advertising as '%s')",
             self._ble_client.device_name,
         )
 
